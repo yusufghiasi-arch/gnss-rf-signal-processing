@@ -1,31 +1,39 @@
 """
-05_raw_bin_signal_inspection_and_peak_search.py
+05_cygnss_raw_if_cold_search.py
 
-Raw .bin IF/IQ signal inspection and GNSS-style correlation peak search.
+CYGNSS raw IF processing demo.
 
-This script demonstrates how to work with local raw binary IF/IQ files:
+This script is a Python translation and cleaned portfolio version of the
+MATLAB workflow developed for CYGNSS raw IF data.
 
-1. Read binary samples from a .bin file
-2. Convert samples into complex IQ data
-3. Plot time-domain I/Q samples
-4. Plot signal magnitude
-5. Estimate and plot spectrum
-6. Detect strong spectral peaks
-7. Optionally perform GPS C/A PRN delay-Doppler correlation search
-8. Report strongest delay-Doppler peaks
+Workflow
+--------
+1. Read CYGNSS metadata file
+2. Read CYGNSS raw data file
+3. Remove DRT0 header if present
+4. Unpack CYGNSS 2-bit sign-magnitude samples
+5. Separate channels:
+   - Channel 0: zenith navigation antenna
+   - Channel 1: nadir science antenna
+   - Channel 2: nadir science antenna
+6. Plot:
+   - channel waveforms
+   - channel histograms
+   - channel spectra
+7. Perform cold search over PRNs and Doppler bins
+8. Plot strongest peak by PRN
+9. Report best PRN, Doppler, delay, and peak quality
+10. Build detailed DDM for selected/best PRN
+11. Plot:
+   - full DDM
+   - zoomed DDM
+   - delay waveform
+   - Doppler waveform
 
-Important:
+Important
 ---------
-Large .bin files should NOT be uploaded to GitHub. Place them locally in the
-data/ folder and update the parameters below.
-
-Because raw binary formats depend on receiver settings, you must confirm:
-
-- sampling frequency
-- IF frequency, if any
-- data type
-- I/Q interleaving format
-- whether the file contains real IF samples or complex IQ samples
+Large .bin files should NOT be uploaded to GitHub.
+Place CYGNSS raw .bin files locally in the data/ folder.
 
 Author: Yusof Ghiasi
 """
@@ -39,50 +47,277 @@ import matplotlib.pyplot as plt
 # User settings
 # =============================================================================
 
-# Put your local .bin file in the data folder.
-# Example:
-# BIN_FILE = "data/sample_if_data_1.bin"
-BIN_FILE = "data/sample_if_data_1.bin"
+META_FILE = "data/cyg04_raw_if_s20250407_035355_e20250407_035455_meta.bin"
+DATA_FILE = "data/cyg04_raw_if_s20250407_035355_e20250407_035455_data.bin"
 
-# Sampling frequency in Hz.
-# Update this based on your file metadata.
-FS = 8.184e6
+# CYGNSS constants used in the MATLAB workflow
+FS = 16.0362e6
+IF_HZ = 3.8722e6
+CODE_RATE = 1.023e6
 
-# Data type in the .bin file.
-# Common options: "int8", "int16", "float32"
-DATA_TYPE = "int8"
+# Number of raw bytes to read from the data file
+NUM_BYTES_TO_READ = 3_000_000
 
-# File format options:
-# "real_if"         : file contains real-valued IF samples
-# "interleaved_iq" : file contains I,Q,I,Q,... samples
-IQ_FORMAT = "interleaved_iq"
+# FFT size for spectrum plots
+NFFT_SPECTRUM = 262_144
 
-# Number of complex samples to read.
-# Keep this moderate for quick testing.
-MAX_COMPLEX_SAMPLES = 200_000
+# Cold search settings
+COLD_SEARCH_CHANNEL = "ch1"       # "ch0", "ch1", or "ch2"
+COLD_SEARCH_NUM_MS = 20
+PRN_LIST = np.arange(1, 33)
+COLD_DOPPLER_BINS = np.arange(-10_000, 10_001, 500)
 
-# Remove DC offset before analysis?
-REMOVE_DC = True
+# Detailed DDM settings
+# If AUTO_DETAILED_FROM_COLD_SEARCH = True, the detailed DDM uses the best
+# PRN and Doppler found in the cold search.
+AUTO_DETAILED_FROM_COLD_SEARCH = True
 
-# Normalize signal power?
-NORMALIZE_POWER = True
+DETAILED_CHANNEL = "ch2"          # used only if AUTO_DETAILED_FROM_COLD_SEARCH is False
+SELECTED_PRN = 10
+CENTER_DOPPLER_HZ = 1500
+DETAILED_NUM_MS = 100
+FINE_DOPPLER_HALF_WIDTH_HZ = 3000
+FINE_DOPPLER_STEP_HZ = 100
 
-# Spectral peak detection
-NUMBER_OF_SPECTRAL_PEAKS = 10
+# Zoomed DDM window
+DELAY_WINDOW_SAMPLES = 600
+DOPPLER_WINDOW_HZ = 1500
 
-# GNSS PRN search settings
-RUN_GNSS_PRN_SEARCH = True
-PRN = 1
+# Figure options
+SAVE_FIGURES = True
+SHOW_FIGURES = True
+FIGURES_DIR = "figures"
 
-# Coherent integration time in milliseconds.
-# GPS C/A code repeats every 1 ms.
-COHERENT_MS = 1
 
-# Doppler search bins in Hz.
-DOPPLER_BINS = np.arange(-5000, 5001, 250)
+# =============================================================================
+# Utility functions
+# =============================================================================
 
-# Report this many strongest delay-Doppler peaks.
-NUMBER_OF_DD_PEAKS = 10
+def finish_figure(filename: str) -> None:
+    """Save and/or show the current matplotlib figure."""
+
+    if SAVE_FIGURES:
+        fig_dir = Path(FIGURES_DIR)
+        fig_dir.mkdir(parents=True, exist_ok=True)
+        plt.savefig(fig_dir / filename, dpi=300, bbox_inches="tight")
+
+    if SHOW_FIGURES:
+        plt.show()
+    else:
+        plt.close()
+
+
+def read_uint8_file(filename: str, count: int | None = None) -> np.ndarray:
+    """Read uint8 data from a binary file."""
+
+    path = Path(filename)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"\nCould not find file:\n{filename}\n\n"
+            "Place the file in the data/ folder or update the filename at the top of this script."
+        )
+
+    if count is None:
+        data = np.fromfile(path, dtype=np.uint8)
+    else:
+        data = np.fromfile(path, dtype=np.uint8, count=count)
+
+    return data
+
+
+def little_endian_uint16(values: np.ndarray) -> int:
+    """Convert two uint8 bytes to little-endian uint16."""
+
+    return int(np.frombuffer(values.astype(np.uint8).tobytes(), dtype="<u2")[0])
+
+
+def little_endian_uint32(values: np.ndarray) -> int:
+    """Convert four uint8 bytes to little-endian uint32."""
+
+    return int(np.frombuffer(values.astype(np.uint8).tobytes(), dtype="<u4")[0])
+
+
+# =============================================================================
+# Metadata reading
+# =============================================================================
+
+def parse_drt0_metadata(meta: np.ndarray) -> dict:
+    """
+    Parse the first DRT0 metadata block.
+
+    This follows the indexing used in the MATLAB script.
+    """
+
+    if len(meta) < 36:
+        raise ValueError("Metadata file is too short to contain DRT0 block.")
+
+    scid = int(meta[0])
+    drt0 = meta[1:36]
+
+    packet_type = bytes(drt0[0:4]).decode(errors="replace")
+
+    gps_week = little_endian_uint16(drt0[4:6])
+    gps_seconds = little_endian_uint32(drt0[6:10])
+
+    data_format = int(drt0[10])
+    sample_rate = little_endian_uint32(drt0[11:15])
+
+    ch0_frontend = int(drt0[15])
+    ch0_lo = little_endian_uint32(drt0[16:20])
+
+    ch1_frontend = int(drt0[20])
+    ch1_lo = little_endian_uint32(drt0[21:25])
+
+    ch2_frontend = int(drt0[25])
+    ch2_lo = little_endian_uint32(drt0[26:30])
+
+    ch3_frontend = int(drt0[30])
+    ch3_lo = little_endian_uint32(drt0[31:35])
+
+    return {
+        "spacecraft_id": scid,
+        "packet_type": packet_type,
+        "gps_week": gps_week,
+        "gps_seconds": gps_seconds,
+        "data_format": data_format,
+        "sample_rate": sample_rate,
+        "ch0_frontend": ch0_frontend,
+        "ch0_lo": ch0_lo,
+        "ch1_frontend": ch1_frontend,
+        "ch1_lo": ch1_lo,
+        "ch2_frontend": ch2_frontend,
+        "ch2_lo": ch2_lo,
+        "ch3_frontend": ch3_frontend,
+        "ch3_lo": ch3_lo,
+    }
+
+
+def print_metadata(metadata: dict, meta_length: int) -> None:
+    """Print metadata information."""
+
+    print(f"Metadata bytes = {meta_length}")
+    print("")
+    print("DRT0 metadata:")
+    print(f"Spacecraft ID = {metadata['spacecraft_id']}")
+    print(f"Packet type = {metadata['packet_type']}")
+    print(f"GPS week = {metadata['gps_week']}")
+    print(f"GPS seconds = {metadata['gps_seconds']}")
+    print(f"Data format = {metadata['data_format']}")
+    print(f"Sample rate = {metadata['sample_rate'] / 1e6:.6f} MHz")
+    print(
+        f"Channel 0 frontend = {metadata['ch0_frontend']} | "
+        f"LO = {metadata['ch0_lo'] / 1e6:.6f} MHz"
+    )
+    print(
+        f"Channel 1 frontend = {metadata['ch1_frontend']} | "
+        f"LO = {metadata['ch1_lo'] / 1e6:.6f} MHz"
+    )
+    print(
+        f"Channel 2 frontend = {metadata['ch2_frontend']} | "
+        f"LO = {metadata['ch2_lo'] / 1e6:.6f} MHz"
+    )
+    print(
+        f"Channel 3 frontend = {metadata['ch3_frontend']} | "
+        f"LO = {metadata['ch3_lo'] / 1e6:.6f} MHz"
+    )
+
+
+# =============================================================================
+# CYGNSS 2-bit unpacking
+# =============================================================================
+
+def signmag_to_value(sign_bit: int, mag_bit: int) -> int:
+    """
+    Convert CYGNSS 2-bit sign-magnitude sample to value.
+
+    mag_bit = 0 -> amplitude 1
+    mag_bit = 1 -> amplitude 3
+
+    sign_bit = 0 -> positive
+    sign_bit = 1 -> negative
+    """
+
+    amp = 1 if mag_bit == 0 else 3
+    return amp if sign_bit == 0 else -amp
+
+
+def unpack_cygnss_2bit(byte_array: np.ndarray) -> np.ndarray:
+    """
+    Unpack CYGNSS 2-bit sign-magnitude samples.
+
+    Each byte contains four 2-bit samples:
+
+    sample 0: bit 8 = sign, bit 7 = magnitude
+    sample 1: bit 6 = sign, bit 5 = magnitude
+    sample 2: bit 4 = sign, bit 3 = magnitude
+    sample 3: bit 2 = sign, bit 1 = magnitude
+
+    This matches the MATLAB bitget implementation.
+    """
+
+    byte_array = byte_array.astype(np.uint8)
+    n = len(byte_array)
+
+    x = np.zeros(n * 4, dtype=np.float64)
+
+    for k, b in enumerate(byte_array):
+        # Python bit numbering: bit 7 is MSB, bit 0 is LSB.
+        s0 = (b >> 7) & 1
+        m0 = (b >> 6) & 1
+
+        s1 = (b >> 5) & 1
+        m1 = (b >> 4) & 1
+
+        s2 = (b >> 3) & 1
+        m2 = (b >> 2) & 1
+
+        s3 = (b >> 1) & 1
+        m3 = b & 1
+
+        x[4 * k + 0] = signmag_to_value(s0, m0)
+        x[4 * k + 1] = signmag_to_value(s1, m1)
+        x[4 * k + 2] = signmag_to_value(s2, m2)
+        x[4 * k + 3] = signmag_to_value(s3, m3)
+
+    return x
+
+
+def split_cygnss_channels(raw: np.ndarray) -> dict:
+    """
+    Split raw CYGNSS bytes into three channels and unpack each channel.
+
+    Byte pattern:
+    byte 1 -> channel 0
+    byte 2 -> channel 1
+    byte 3 -> channel 2
+    then repeats.
+    """
+
+    first4_alt = bytes(raw[:4]).decode(errors="replace")
+
+    if first4_alt == "DRT0":
+        print("Data file starts with DRT0 header, removing first 36 bytes")
+        raw = raw[36:]
+    else:
+        print("No DRT0 header removed from data file")
+
+    num_groups = len(raw) // 3
+    raw = raw[: num_groups * 3]
+
+    b0 = raw[0::3]
+    b1 = raw[1::3]
+    b2 = raw[2::3]
+
+    ch0 = unpack_cygnss_2bit(b0)
+    ch1 = unpack_cygnss_2bit(b1)
+    ch2 = unpack_cygnss_2bit(b2)
+
+    return {
+        "ch0": ch0,
+        "ch1": ch1,
+        "ch2": ch2,
+    }
 
 
 # =============================================================================
@@ -90,20 +325,7 @@ NUMBER_OF_DD_PEAKS = 10
 # =============================================================================
 
 def generate_ca_code(prn: int) -> np.ndarray:
-    """
-    Generate GPS L1 C/A code for selected PRN.
-
-    Parameters
-    ----------
-    prn : int
-        GPS satellite PRN number. This demo supports PRNs 1 to 32.
-
-    Returns
-    -------
-    ca_code : np.ndarray
-        GPS C/A code sequence with values -1 and +1.
-        Length is 1023 chips.
-    """
+    """Generate GPS L1 C/A code with values -1/+1."""
 
     g2_taps = {
         1: (2, 6),
@@ -141,20 +363,20 @@ def generate_ca_code(prn: int) -> np.ndarray:
     }
 
     if prn not in g2_taps:
-        raise ValueError("This demo supports GPS PRNs 1 to 32.")
+        raise ValueError("PRN must be between 1 and 32.")
 
     tap1, tap2 = g2_taps[prn]
 
     g1 = np.ones(10, dtype=int)
     g2 = np.ones(10, dtype=int)
 
-    ca_code = np.zeros(1023, dtype=int)
+    ca = np.zeros(1023, dtype=int)
 
     for i in range(1023):
         g1_output = g1[-1]
         g2_output = g2[tap1 - 1] ^ g2[tap2 - 1]
 
-        ca_code[i] = g1_output ^ g2_output
+        ca[i] = g1_output ^ g2_output
 
         g1_feedback = g1[2] ^ g1[9]
         g2_feedback = g2[1] ^ g2[2] ^ g2[5] ^ g2[7] ^ g2[8] ^ g2[9]
@@ -165,487 +387,464 @@ def generate_ca_code(prn: int) -> np.ndarray:
         g2[1:] = g2[:-1]
         g2[0] = g2_feedback
 
-    ca_code = 1 - 2 * ca_code
-
-    return ca_code
+    return 1 - 2 * ca
 
 
-def resample_ca_code(ca_code: np.ndarray, fs: float, code_rate: float, n_samples: int) -> np.ndarray:
-    """
-    Resample the 1023-chip GPS C/A code to the sampling frequency.
-    """
+def sampled_ca_code_for_one_ms(prn: int, fs: float, samples_per_ms: int) -> np.ndarray:
+    """Generate sampled GPS C/A code for one 1-ms block."""
 
-    sample_index = np.arange(n_samples)
-    chip_index = np.floor(sample_index * code_rate / fs).astype(int) % 1023
-    sampled_code = ca_code[chip_index]
+    ca = generate_ca_code(prn)
 
-    return sampled_code
+    t = np.arange(samples_per_ms) / fs
+    chip_index = np.floor(t * CODE_RATE).astype(int)
 
+    chip_index[chip_index > 1022] = 1022
 
-# =============================================================================
-# Raw binary reading
-# =============================================================================
+    local_code = ca[chip_index].astype(np.float64)
 
-def read_raw_bin_file(
-    bin_file: str,
-    data_type: str,
-    iq_format: str,
-    max_complex_samples: int,
-) -> np.ndarray:
-    """
-    Read raw .bin file and return complex samples.
-
-    Parameters
-    ----------
-    bin_file : str
-        Path to binary file.
-    data_type : str
-        Data type in file. Example: "int8", "int16", "float32".
-    iq_format : str
-        "real_if" or "interleaved_iq".
-    max_complex_samples : int
-        Maximum number of complex samples to return.
-
-    Returns
-    -------
-    samples : np.ndarray
-        Complex samples.
-    """
-
-    path = Path(bin_file)
-
-    if not path.exists():
-        raise FileNotFoundError(
-            f"\nCould not find file:\n{path}\n\n"
-            "Place your .bin file in the data/ folder or update BIN_FILE at the top of this script."
-        )
-
-    dtype = np.dtype(data_type)
-
-    if iq_format == "interleaved_iq":
-        # Need 2 raw values per complex sample.
-        raw_count = max_complex_samples * 2
-        raw = np.fromfile(path, dtype=dtype, count=raw_count)
-
-        if len(raw) < 2:
-            raise ValueError("File does not contain enough samples.")
-
-        if len(raw) % 2 != 0:
-            raw = raw[:-1]
-
-        i_samples = raw[0::2].astype(np.float64)
-        q_samples = raw[1::2].astype(np.float64)
-
-        samples = i_samples + 1j * q_samples
-
-    elif iq_format == "real_if":
-        raw = np.fromfile(path, dtype=dtype, count=max_complex_samples)
-        samples = raw.astype(np.float64).astype(np.complex128)
-
-    else:
-        raise ValueError("IQ_FORMAT must be either 'real_if' or 'interleaved_iq'.")
-
-    return samples
-
-
-def preprocess_samples(
-    samples: np.ndarray,
-    remove_dc: bool,
-    normalize_power: bool,
-) -> np.ndarray:
-    """
-    Remove DC offset and optionally normalize signal power.
-    """
-
-    x = samples.copy()
-
-    if remove_dc:
-        x = x - np.mean(x)
-
-    if normalize_power:
-        power = np.mean(np.abs(x) ** 2)
-        if power > 0:
-            x = x / np.sqrt(power)
-
-    return x
+    return local_code
 
 
 # =============================================================================
-# Signal inspection
+# Plots: channels, histograms, spectra
 # =============================================================================
 
-def plot_time_domain(samples: np.ndarray, fs: float, number_of_samples: int = 2000) -> None:
-    """
-    Plot I, Q, and magnitude in time domain.
-    """
+def plot_channels(channels: dict, n: int = 2000) -> None:
+    """Plot time-domain samples for each CYGNSS channel."""
 
-    n = min(number_of_samples, len(samples))
-    t_ms = np.arange(n) / fs * 1e3
+    labels = {
+        "ch0": "Channel 0 - zenith navigation antenna",
+        "ch1": "Channel 1 - nadir science antenna",
+        "ch2": "Channel 2 - nadir science antenna",
+    }
 
-    plt.figure(figsize=(10, 5))
-    plt.plot(t_ms, np.real(samples[:n]), label="I / real")
-    plt.plot(t_ms, np.imag(samples[:n]), label="Q / imag")
-    plt.xlabel("Time (ms)")
-    plt.ylabel("Amplitude")
-    plt.title("Raw IF/IQ Samples: I and Q")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure(figsize=(10, 4))
-    plt.plot(t_ms, np.abs(samples[:n]))
-    plt.xlabel("Time (ms)")
-    plt.ylabel("Magnitude")
-    plt.title("Raw IF/IQ Sample Magnitude")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
+    for name, x in channels.items():
+        plt.figure(figsize=(10, 4))
+        plt.plot(x[:n])
+        plt.grid(True)
+        plt.title(labels[name])
+        plt.xlabel("Sample number")
+        plt.ylabel("Amplitude")
+        plt.tight_layout()
+        finish_figure(f"06_{name}_time_series.png")
 
 
-def compute_spectrum(samples: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Compute simple FFT spectrum.
-    """
+def plot_histograms(channels: dict) -> None:
+    """Plot histograms for CYGNSS channels."""
 
-    n = len(samples)
-
-    # Window reduces spectral leakage.
-    window = np.hanning(n)
-    xw = samples * window
-
-    spectrum = np.fft.fftshift(np.fft.fft(xw))
-    freqs = np.fft.fftshift(np.fft.fftfreq(n, d=1 / fs))
-
-    psd_db = 20 * np.log10(np.abs(spectrum) + 1e-12)
-
-    return freqs, psd_db
+    for name, x in channels.items():
+        plt.figure(figsize=(7, 4))
+        plt.hist(x, bins=np.arange(-3.5, 4.5, 1.0), edgecolor="black")
+        plt.grid(True)
+        plt.title(f"{name} histogram")
+        plt.xlabel("Value")
+        plt.ylabel("Count")
+        plt.tight_layout()
+        finish_figure(f"06_{name}_histogram.png")
 
 
-def plot_spectrum(freqs: np.ndarray, psd_db: np.ndarray) -> None:
-    """
-    Plot spectrum.
-    """
+def plot_spectra(channels: dict, fs: float, nfft: int) -> None:
+    """Plot spectrum for each CYGNSS channel."""
 
-    plt.figure(figsize=(10, 5))
-    plt.plot(freqs / 1e6, psd_db)
-    plt.xlabel("Frequency (MHz)")
-    plt.ylabel("Magnitude (dB)")
-    plt.title("Raw IF/IQ Spectrum")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
+    f = np.linspace(-fs / 2, fs / 2, nfft)
 
+    for name, x in channels.items():
+        if len(x) < nfft:
+            raise ValueError(f"Not enough samples in {name} for NFFT={nfft}")
 
-def find_spectral_peaks(
-    freqs: np.ndarray,
-    psd_db: np.ndarray,
-    number_of_peaks: int,
-    guard_bins: int = 20,
-) -> list[tuple[float, float]]:
-    """
-    Find strongest spectral peaks using simple non-maximum suppression.
+        xx = x[:nfft].astype(np.float64)
+        xx = xx - np.mean(xx)
 
-    Parameters
-    ----------
-    freqs : np.ndarray
-        Frequency axis in Hz.
-    psd_db : np.ndarray
-        Spectrum magnitude in dB.
-    number_of_peaks : int
-        Number of peaks to report.
-    guard_bins : int
-        Number of neighboring bins to suppress after selecting a peak.
+        spectrum_power = np.fft.fftshift(np.abs(np.fft.fft(xx)) ** 2)
+        spectrum_db = 10 * np.log10(spectrum_power + 1e-12)
 
-    Returns
-    -------
-    peaks : list of tuple
-        List of (frequency_hz, magnitude_db).
-    """
-
-    spectrum_copy = psd_db.copy()
-    peaks = []
-
-    for _ in range(number_of_peaks):
-        idx = int(np.argmax(spectrum_copy))
-
-        peak_freq = freqs[idx]
-        peak_mag = psd_db[idx]
-
-        peaks.append((peak_freq, peak_mag))
-
-        start = max(0, idx - guard_bins)
-        end = min(len(spectrum_copy), idx + guard_bins + 1)
-        spectrum_copy[start:end] = -np.inf
-
-    return peaks
+        plt.figure(figsize=(10, 4))
+        plt.plot(f / 1e6, spectrum_db)
+        plt.grid(True)
+        plt.title(f"Spectrum - {name}")
+        plt.xlabel("Frequency (MHz)")
+        plt.ylabel("Power (dB)")
+        plt.tight_layout()
+        finish_figure(f"06_{name}_spectrum.png")
 
 
 # =============================================================================
-# Delay-Doppler PRN search
+# Acquisition / DDM
 # =============================================================================
 
-def gnss_delay_doppler_search(
-    samples: np.ndarray,
-    fs: float,
+def build_ddm(
+    rx_channel: np.ndarray,
     prn: int,
-    coherent_ms: int,
+    fs: float,
+    if_hz: float,
     doppler_bins: np.ndarray,
-) -> tuple[np.ndarray, int, float, float]:
+    num_ms: int,
+) -> np.ndarray:
     """
-    Perform GPS C/A PRN delay-Doppler search on raw samples.
+    Build noncoherently integrated delay-Doppler map.
 
-    This assumes the samples contain a GPS C/A-like signal and that the
-    sampling frequency is set correctly.
-
-    Parameters
-    ----------
-    samples : np.ndarray
-        Complex raw samples.
-    fs : float
-        Sampling frequency in Hz.
-    prn : int
-        GPS PRN number.
-    coherent_ms : int
-        Coherent integration time in milliseconds.
-    doppler_bins : np.ndarray
-        Doppler bins in Hz.
-
-    Returns
-    -------
-    acquisition_map : np.ndarray
-        Correlation power map [doppler, delay].
-    estimated_delay_samples : int
-        Estimated code delay in samples.
-    estimated_doppler_hz : float
-        Estimated Doppler frequency in Hz.
-    peak_power : float
-        Maximum correlation power.
+    For each 1-ms block:
+    - wipe off IF + Doppler
+    - correlate with local PRN
+    - add correlation power
     """
 
-    code_rate = 1.023e6
-    n_samples = int(fs * coherent_ms * 1e-3)
+    samples_per_ms = int(round(fs * 0.001))
+    needed_samples = num_ms * samples_per_ms
 
-    if len(samples) < n_samples:
-        raise ValueError(
-            f"Not enough samples for {coherent_ms} ms coherent integration. "
-            f"Need {n_samples}, but file has {len(samples)}."
+    if len(rx_channel) < needed_samples:
+        raise ValueError("Not enough samples in selected channel.")
+
+    rx = rx_channel[:needed_samples].astype(np.float64)
+    rx = rx - np.mean(rx)
+    rx = rx.reshape(-1)
+
+    t = np.arange(samples_per_ms) / fs
+
+    local_code = sampled_ca_code_for_one_ms(prn, fs, samples_per_ms)
+    code_fft = np.fft.fft(local_code)
+
+    ddm_sum = np.zeros((len(doppler_bins), samples_per_ms), dtype=np.float64)
+
+    for m in range(num_ms):
+        start = m * samples_per_ms
+        end = start + samples_per_ms
+
+        signal_block = rx[start:end]
+
+        for d, fd in enumerate(doppler_bins):
+            carrier = np.exp(-1j * 2 * np.pi * (if_hz + fd) * t)
+
+            signal_wiped = signal_block * carrier
+
+            corr_fft = np.fft.ifft(np.fft.fft(signal_wiped) * np.conj(code_fft))
+
+            ddm_sum[d, :] += np.abs(corr_fft) ** 2
+
+    ddm_avg = ddm_sum / num_ms
+
+    return ddm_avg
+
+
+def cold_search(
+    rx_channel: np.ndarray,
+    channel_name: str,
+    prn_list: np.ndarray,
+    doppler_bins: np.ndarray,
+    num_ms: int,
+    fs: float,
+    if_hz: float,
+) -> tuple[np.ndarray, dict]:
+    """Cold search over PRNs and Doppler bins."""
+
+    results = []
+
+    print("")
+    print("Starting CYGNSS cold search...")
+    print(f"Channel = {channel_name}")
+    print(f"num_ms = {num_ms}")
+
+    for prn in prn_list:
+        ddm_avg = build_ddm(
+            rx_channel=rx_channel,
+            prn=int(prn),
+            fs=fs,
+            if_hz=if_hz,
+            doppler_bins=doppler_bins,
+            num_ms=num_ms,
         )
 
-    x = samples[:n_samples]
+        max_index = np.unravel_index(np.argmax(ddm_avg), ddm_avg.shape)
 
-    ca_code = generate_ca_code(prn)
-    local_code = resample_ca_code(ca_code, fs, code_rate, n_samples)
+        doppler_index = max_index[0]
+        delay_index = max_index[1]
 
-    t = np.arange(n_samples) / fs
+        max_value = ddm_avg[doppler_index, delay_index]
+        best_doppler = doppler_bins[doppler_index]
 
-    code_fft = np.fft.fft(local_code)
-    acquisition_map = np.zeros((len(doppler_bins), n_samples))
+        results.append(
+            {
+                "prn": int(prn),
+                "best_doppler": float(best_doppler),
+                "best_delay": int(delay_index + 1),  # MATLAB-style display
+                "best_delay_python": int(delay_index),
+                "peak": float(max_value),
+                "ddm": ddm_avg,
+            }
+        )
 
-    for i, doppler in enumerate(doppler_bins):
-        wipeoff = np.exp(-1j * 2 * np.pi * doppler * t)
-        mixed = x * wipeoff
+        print(
+            f"PRN {prn:2d} | Peak = {max_value:.6e} | "
+            f"Doppler = {best_doppler:+8.1f} Hz | Delay = {delay_index + 1}"
+        )
 
-        signal_fft = np.fft.fft(mixed)
-        corr = np.fft.ifft(signal_fft * np.conj(code_fft))
+    result_table = np.array(
+        [
+            [r["prn"], r["best_doppler"], r["best_delay"], r["peak"]]
+            for r in results
+        ],
+        dtype=np.float64,
+    )
 
-        acquisition_map[i, :] = np.abs(corr) ** 2
+    best_result = max(results, key=lambda item: item["peak"])
 
-    peak_idx = np.unravel_index(np.argmax(acquisition_map), acquisition_map.shape)
-
-    doppler_idx = peak_idx[0]
-    delay_idx = peak_idx[1]
-
-    estimated_doppler_hz = doppler_bins[doppler_idx]
-    estimated_delay_samples = delay_idx
-    peak_power = acquisition_map[doppler_idx, delay_idx]
-
-    return acquisition_map, estimated_delay_samples, estimated_doppler_hz, peak_power
-
-
-def find_delay_doppler_peaks(
-    acquisition_map: np.ndarray,
-    doppler_bins: np.ndarray,
-    number_of_peaks: int,
-    delay_guard_bins: int = 20,
-    doppler_guard_bins: int = 1,
-) -> list[tuple[int, float, float]]:
-    """
-    Find strongest delay-Doppler peaks using simple non-maximum suppression.
-
-    Returns
-    -------
-    peaks : list of tuple
-        List of (delay_samples, doppler_hz, peak_power).
-    """
-
-    surface = acquisition_map.copy()
-    peaks = []
-
-    for _ in range(number_of_peaks):
-        peak_idx = np.unravel_index(np.argmax(surface), surface.shape)
-
-        doppler_idx = peak_idx[0]
-        delay_idx = peak_idx[1]
-
-        peak_power = acquisition_map[doppler_idx, delay_idx]
-        peak_doppler = doppler_bins[doppler_idx]
-
-        peaks.append((delay_idx, peak_doppler, peak_power))
-
-        d0 = max(0, doppler_idx - doppler_guard_bins)
-        d1 = min(surface.shape[0], doppler_idx + doppler_guard_bins + 1)
-
-        c0 = max(0, delay_idx - delay_guard_bins)
-        c1 = min(surface.shape[1], delay_idx + delay_guard_bins + 1)
-
-        surface[d0:d1, c0:c1] = -np.inf
-
-    return peaks
+    return result_table, best_result
 
 
-def plot_acquisition_map(
-    acquisition_map: np.ndarray,
-    doppler_bins: np.ndarray,
-    estimated_delay: int,
-    estimated_doppler: float,
+def plot_cold_search_results(results_cold: np.ndarray, channel_name: str, num_ms: int) -> None:
+    """Plot strongest peak for each PRN."""
+
+    plt.figure(figsize=(10, 5))
+    plt.bar(results_cold[:, 0], results_cold[:, 3])
+    plt.grid(True)
+    plt.title(f"CYGNSS Raw IF cold search - {channel_name} - {num_ms} ms")
+    plt.xlabel("PRN")
+    plt.ylabel("Peak power")
+    plt.tight_layout()
+    finish_figure("06_cold_search_peak_by_prn.png")
+
+
+def print_peak_quality(results_cold: np.ndarray, best_result: dict) -> None:
+    """Print best result and peak quality metrics."""
+
+    peaks = results_cold[:, 3]
+    sorted_peaks = np.sort(peaks)[::-1]
+
+    print("")
+    print("Best cold-search result:")
+    print(f"Best PRN = {best_result['prn']}")
+    print(f"Best Doppler = {best_result['best_doppler']:.1f} Hz")
+    print(f"Best delay = {best_result['best_delay']}")
+    print(f"Best peak = {best_result['peak']:.6e}")
+
+    print("")
+    print("Cold-search peak quality:")
+    print(f"Best / second best = {sorted_peaks[0] / sorted_peaks[1]:.6f}")
+    print(f"Best / median = {sorted_peaks[0] / np.median(peaks):.6f}")
+    print(f"Best / mean = {sorted_peaks[0] / np.mean(peaks):.6f}")
+
+
+def detailed_ddm_analysis(
+    channels: dict,
+    channel_name: str,
+    selected_prn: int,
+    center_doppler_hz: float,
+    num_ms: int,
+    fs: float,
+    if_hz: float,
 ) -> None:
-    """
-    Plot delay-Doppler acquisition map.
-    """
+    """Build and plot detailed DDM for selected PRN and channel."""
 
+    rx_channel = channels[channel_name]
+
+    doppler_bins_fine = np.arange(
+        center_doppler_hz - FINE_DOPPLER_HALF_WIDTH_HZ,
+        center_doppler_hz + FINE_DOPPLER_HALF_WIDTH_HZ + FINE_DOPPLER_STEP_HZ,
+        FINE_DOPPLER_STEP_HZ,
+    )
+
+    ddm_avg = build_ddm(
+        rx_channel=rx_channel,
+        prn=selected_prn,
+        fs=fs,
+        if_hz=if_hz,
+        doppler_bins=doppler_bins_fine,
+        num_ms=num_ms,
+    )
+
+    max_index = np.unravel_index(np.argmax(ddm_avg), ddm_avg.shape)
+
+    doppler_index = max_index[0]
+    delay_index = max_index[1]
+
+    max_value = ddm_avg[doppler_index, delay_index]
+    best_doppler = doppler_bins_fine[doppler_index]
+    best_delay = delay_index + 1  # MATLAB-style display
+
+    print("")
+    print("Detailed DDM result:")
+    print(f"Channel = {channel_name}")
+    print(f"PRN = {selected_prn}")
+    print(f"Best Doppler = {best_doppler:.1f} Hz")
+    print(f"Best delay = {best_delay} samples")
+    print(f"Peak = {max_value:.6e}")
+
+    samples_per_ms = int(round(fs * 0.001))
+    delay_axis = np.arange(1, samples_per_ms + 1)
+
+    # Full DDM
     plt.figure(figsize=(10, 6))
     plt.imshow(
-        10 * np.log10(acquisition_map + 1e-12),
+        ddm_avg,
         aspect="auto",
         origin="lower",
         extent=[
-            0,
-            acquisition_map.shape[1] - 1,
-            doppler_bins[0],
-            doppler_bins[-1],
+            delay_axis[0],
+            delay_axis[-1],
+            doppler_bins_fine[0],
+            doppler_bins_fine[-1],
         ],
     )
-    plt.colorbar(label="Correlation power (dB)")
-    plt.scatter(
-        estimated_delay,
-        estimated_doppler,
-        marker="x",
-        s=100,
-        linewidths=2,
-        label="Strongest peak",
-    )
-    plt.xlabel("Code delay (samples)")
-    plt.ylabel("Doppler frequency (Hz)")
-    plt.title("Raw .bin GNSS PRN Delay-Doppler Search")
-    plt.legend()
+    plt.colorbar(label="Power")
+    plt.grid(True)
+    plt.scatter(best_delay, best_doppler, marker="o", s=100, facecolors="none", edgecolors="white", linewidths=2)
+    plt.title(f"Detailed DDM - {channel_name} - PRN {selected_prn}")
+    plt.xlabel("Delay sample")
+    plt.ylabel("Doppler (Hz)")
     plt.tight_layout()
-    plt.show()
+    finish_figure("06_detailed_ddm_full.png")
+
+    # Zoomed DDM
+    delay_min = max(1, best_delay - DELAY_WINDOW_SAMPLES)
+    delay_max = min(samples_per_ms, best_delay + DELAY_WINDOW_SAMPLES)
+
+    doppler_min = best_doppler - DOPPLER_WINDOW_HZ
+    doppler_max = best_doppler + DOPPLER_WINDOW_HZ
+
+    delay_min_idx = delay_min - 1
+    delay_max_idx = delay_max
+
+    doppler_rows = (doppler_bins_fine >= doppler_min) & (doppler_bins_fine <= doppler_max)
+
+    plt.figure(figsize=(10, 6))
+    plt.imshow(
+        ddm_avg[doppler_rows, delay_min_idx:delay_max_idx],
+        aspect="auto",
+        origin="lower",
+        extent=[
+            delay_min,
+            delay_max,
+            doppler_bins_fine[doppler_rows][0],
+            doppler_bins_fine[doppler_rows][-1],
+        ],
+    )
+    plt.colorbar(label="Power")
+    plt.grid(True)
+    plt.scatter(best_delay, best_doppler, marker="o", s=100, facecolors="none", edgecolors="white", linewidths=2)
+    plt.title(f"Zoomed DDM - {channel_name} - PRN {selected_prn}")
+    plt.xlabel("Delay sample")
+    plt.ylabel("Doppler (Hz)")
+    plt.tight_layout()
+    finish_figure("06_detailed_ddm_zoomed.png")
+
+    # Delay waveform at best Doppler
+    best_delay_waveform = ddm_avg[doppler_index, :]
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(delay_axis, best_delay_waveform)
+    plt.grid(True)
+    plt.scatter(best_delay, max_value, marker="o", s=80)
+    plt.title(f"Delay waveform - PRN {selected_prn} - Doppler {best_doppler:.1f} Hz")
+    plt.xlabel("Delay sample")
+    plt.ylabel("Power")
+    plt.tight_layout()
+    finish_figure("06_delay_waveform.png")
+
+    # Doppler waveform at best delay
+    best_doppler_waveform = ddm_avg[:, delay_index]
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(doppler_bins_fine, best_doppler_waveform)
+    plt.grid(True)
+    plt.scatter(best_doppler, max_value, marker="o", s=80)
+    plt.title(f"Doppler waveform - PRN {selected_prn} - delay {best_delay}")
+    plt.xlabel("Doppler (Hz)")
+    plt.ylabel("Power")
+    plt.tight_layout()
+    finish_figure("06_doppler_waveform.png")
 
 
 # =============================================================================
-# Main script
+# Main
 # =============================================================================
 
 def main() -> None:
-    """
-    Run raw .bin inspection and optional GNSS PRN peak search.
-    """
+    """Run CYGNSS raw IF processing workflow."""
 
-    print("Raw .bin IF/IQ Signal Inspection and Peak Search")
-    print("================================================")
-    print(f"File: {BIN_FILE}")
-    print(f"Sampling frequency: {FS / 1e6:.3f} MHz")
-    print(f"Data type: {DATA_TYPE}")
-    print(f"IQ format: {IQ_FORMAT}")
-    print("")
+    print("CYGNSS Raw IF Processing Demo")
+    print("=============================")
+    print(f"Metadata file: {META_FILE}")
+    print(f"Data file: {DATA_FILE}")
 
-    samples = read_raw_bin_file(
-        bin_file=BIN_FILE,
-        data_type=DATA_TYPE,
-        iq_format=IQ_FORMAT,
-        max_complex_samples=MAX_COMPLEX_SAMPLES,
-    )
+    # Metadata
+    meta = read_uint8_file(META_FILE)
+    metadata = parse_drt0_metadata(meta)
+    print_metadata(metadata, len(meta))
 
-    samples = preprocess_samples(
-        samples=samples,
-        remove_dc=REMOVE_DC,
-        normalize_power=NORMALIZE_POWER,
-    )
-
-    print(f"Loaded complex samples: {len(samples):,}")
-    print(f"Mean power after preprocessing: {np.mean(np.abs(samples) ** 2):.3f}")
-    print("")
-
-    # Time-domain inspection
-    plot_time_domain(samples, fs=FS)
-
-    # Spectrum inspection
-    freqs, psd_db = compute_spectrum(samples, fs=FS)
-    plot_spectrum(freqs, psd_db)
-
-    spectral_peaks = find_spectral_peaks(
-        freqs=freqs,
-        psd_db=psd_db,
-        number_of_peaks=NUMBER_OF_SPECTRAL_PEAKS,
-    )
-
-    print("Strongest spectral peaks")
-    print("------------------------")
-    for idx, (freq_hz, mag_db) in enumerate(spectral_peaks, start=1):
-        print(f"{idx:02d}: frequency = {freq_hz / 1e6:+.6f} MHz, magnitude = {mag_db:.2f} dB")
+    samples_per_ms = int(round(FS * 0.001))
 
     print("")
+    print(f"Using Fs = {FS / 1e6:.6f} MHz")
+    print(f"Using IF = {IF_HZ / 1e6:.6f} MHz")
+    print(f"Samples per 1 ms = {samples_per_ms}")
 
-    if RUN_GNSS_PRN_SEARCH:
-        print("Running GNSS PRN delay-Doppler search")
-        print("-------------------------------------")
-        print(f"PRN: {PRN}")
-        print(f"Coherent integration: {COHERENT_MS} ms")
-        print(f"Doppler range: {DOPPLER_BINS[0]} to {DOPPLER_BINS[-1]} Hz")
-        print(f"Doppler step: {DOPPLER_BINS[1] - DOPPLER_BINS[0]} Hz")
-        print("")
+    # Data
+    raw = read_uint8_file(DATA_FILE, count=NUM_BYTES_TO_READ)
 
-        acquisition_map, estimated_delay, estimated_doppler, peak_power = gnss_delay_doppler_search(
-            samples=samples,
-            fs=FS,
-            prn=PRN,
-            coherent_ms=COHERENT_MS,
-            doppler_bins=DOPPLER_BINS,
-        )
+    print("")
+    print(f"Read data bytes = {len(raw)}")
 
-        print("Strongest delay-Doppler result")
-        print("------------------------------")
-        print(f"Estimated code delay: {estimated_delay} samples")
-        print(f"Estimated Doppler:    {estimated_doppler:.1f} Hz")
-        print(f"Peak power:           {peak_power:.2e}")
-        print("")
+    print("")
+    print("First 40 data bytes:")
+    print(raw[:40])
 
-        dd_peaks = find_delay_doppler_peaks(
-            acquisition_map=acquisition_map,
-            doppler_bins=DOPPLER_BINS,
-            number_of_peaks=NUMBER_OF_DD_PEAKS,
-        )
+    if len(raw) >= 5:
+        first4 = bytes(raw[1:5]).decode(errors="replace")
+        if first4 == "DRT":
+            print("DRT header seems present in data file")
 
-        print("Top delay-Doppler peaks")
-        print("-----------------------")
-        for idx, (delay, doppler, power) in enumerate(dd_peaks, start=1):
-            print(
-                f"{idx:02d}: delay = {delay:5d} samples, "
-                f"doppler = {doppler:+8.1f} Hz, "
-                f"power = {power:.2e}"
-            )
+    channels = split_cygnss_channels(raw)
 
-        plot_acquisition_map(
-            acquisition_map=acquisition_map,
-            doppler_bins=DOPPLER_BINS,
-            estimated_delay=estimated_delay,
-            estimated_doppler=estimated_doppler,
-        )
+    print("")
+    print(f"Channel 0 samples = {len(channels['ch0'])}")
+    print(f"Channel 1 samples = {len(channels['ch1'])}")
+    print(f"Channel 2 samples = {len(channels['ch2'])}")
 
+    # Basic plots
+    plot_channels(channels)
+    plot_histograms(channels)
+    plot_spectra(channels, fs=FS, nfft=NFFT_SPECTRUM)
+
+    # Cold search
+    rx_channel = channels[COLD_SEARCH_CHANNEL]
+
+    results_cold, best_result = cold_search(
+        rx_channel=rx_channel,
+        channel_name=COLD_SEARCH_CHANNEL,
+        prn_list=PRN_LIST,
+        doppler_bins=COLD_DOPPLER_BINS,
+        num_ms=COLD_SEARCH_NUM_MS,
+        fs=FS,
+        if_hz=IF_HZ,
+    )
+
+    plot_cold_search_results(
+        results_cold=results_cold,
+        channel_name=COLD_SEARCH_CHANNEL,
+        num_ms=COLD_SEARCH_NUM_MS,
+    )
+
+    print_peak_quality(results_cold, best_result)
+
+    # Detailed DDM
+    if AUTO_DETAILED_FROM_COLD_SEARCH:
+        detailed_channel = COLD_SEARCH_CHANNEL
+        selected_prn = best_result["prn"]
+        center_doppler = best_result["best_doppler"]
     else:
-        print("GNSS PRN delay-Doppler search skipped.")
-        print("Set RUN_GNSS_PRN_SEARCH = True to enable it.")
+        detailed_channel = DETAILED_CHANNEL
+        selected_prn = SELECTED_PRN
+        center_doppler = CENTER_DOPPLER_HZ
+
+    detailed_ddm_analysis(
+        channels=channels,
+        channel_name=detailed_channel,
+        selected_prn=int(selected_prn),
+        center_doppler_hz=float(center_doppler),
+        num_ms=DETAILED_NUM_MS,
+        fs=FS,
+        if_hz=IF_HZ,
+    )
 
 
 if __name__ == "__main__":
